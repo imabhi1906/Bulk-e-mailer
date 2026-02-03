@@ -1,4 +1,4 @@
-import { createTransporter, sendEmail } from './mailer.js';
+import { createTransporter, sendEmail, verifyConnection } from './mailer.js';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -128,8 +128,25 @@ export async function processEmailJob(jobData) {
       type: 'info',
     });
 
-    // Create transporter
+    // Create and verify transporter connection
     const transporter = createTransporter();
+    const connectionValid = await verifyConnection(transporter);
+    
+    if (!connectionValid) {
+      currentJob.status = 'failed';
+      currentJob.logs.push({
+        timestamp: new Date().toISOString(),
+        message: 'Failed to establish SMTP connection. Please check your credentials.',
+        type: 'error',
+      });
+      return;
+    }
+
+    currentJob.logs.push({
+      timestamp: new Date().toISOString(),
+      message: 'SMTP connection verified. Starting to send emails...',
+      type: 'info',
+    });
 
     // Prepare attachment if provided
     const attachments = [];
@@ -141,47 +158,70 @@ export async function processEmailJob(jobData) {
       });
     }
 
-    // Send emails sequentially with 500ms delay
-    for (const row of normalizedRows) {
-      const recipientName = row.name || 'Recipient';
-      const recipientEmail = row.email;
+    // Send emails in parallel batches for maximum speed
+    // Gmail allows up to 14 emails/second, so we use concurrency of 5-7 for safety
+    const CONCURRENCY_LIMIT = 5; // Send 5 emails in parallel
+    const batches = [];
+    
+    for (let i = 0; i < normalizedRows.length; i += CONCURRENCY_LIMIT) {
+      batches.push(normalizedRows.slice(i, i + CONCURRENCY_LIMIT));
+    }
 
-      // Personalize message
-      const personalizedMessage = message.replace(/\{name\}/g, recipientName);
+    // Process batches sequentially, but emails within each batch in parallel
+    for (let batchIndex = 0; batchIndex < batches.length; batchIndex++) {
+      const batch = batches[batchIndex];
+      
+      // Send all emails in this batch in parallel
+      const batchPromises = batch.map(async (row) => {
+        const recipientName = row.name || 'Recipient';
+        const recipientEmail = row.email;
 
-      const result = await sendEmail(transporter, {
-        to: recipientEmail,
-        subject,
-        text: personalizedMessage,
-        attachments: attachments.length > 0 ? attachments : undefined,
+        // Personalize message
+        const personalizedMessage = message.replace(/\{name\}/g, recipientName);
+
+        const result = await sendEmail(transporter, {
+          to: recipientEmail,
+          subject,
+          text: personalizedMessage,
+          attachments: attachments.length > 0 ? attachments : undefined,
+        });
+
+        // Update job state (thread-safe updates)
+        if (result.success) {
+          currentJob.sent++;
+          const timestamp = new Date();
+          const formattedTime = timestamp.toLocaleString('en-GB', {
+            day: '2-digit',
+            month: '2-digit',
+            year: 'numeric',
+            hour: '2-digit',
+            minute: '2-digit',
+          });
+          currentJob.logs.push({
+            timestamp: timestamp.toISOString(),
+            message: `Mail sent to ${recipientName} @ ${formattedTime}`,
+            type: 'success',
+          });
+        } else {
+          currentJob.failed++;
+          currentJob.logs.push({
+            timestamp: new Date().toISOString(),
+            message: `Failed to send to ${recipientName} (${recipientEmail}): ${result.error}`,
+            type: 'error',
+          });
+        }
+
+        return result;
       });
 
-      if (result.success) {
-        currentJob.sent++;
-        const timestamp = new Date();
-        const formattedTime = timestamp.toLocaleString('en-GB', {
-          day: '2-digit',
-          month: '2-digit',
-          year: 'numeric',
-          hour: '2-digit',
-          minute: '2-digit',
-        });
-        currentJob.logs.push({
-          timestamp: timestamp.toISOString(),
-          message: `Mail sent to ${recipientName} @ ${formattedTime}`,
-          type: 'success',
-        });
-      } else {
-        currentJob.failed++;
-        currentJob.logs.push({
-          timestamp: new Date().toISOString(),
-          message: `Failed to send to ${recipientName} (${recipientEmail}): ${result.error}`,
-          type: 'error',
-        });
-      }
+      // Wait for all emails in this batch to complete
+      await Promise.all(batchPromises);
 
-      // 500ms delay between emails
-      await new Promise((resolve) => setTimeout(resolve, 500));
+      // Small delay between batches to respect rate limits (50ms)
+      // This ensures we stay well under Gmail's 14 emails/second limit
+      if (batchIndex < batches.length - 1) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
     }
 
     currentJob.status = 'completed';

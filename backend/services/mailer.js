@@ -5,6 +5,7 @@ dotenv.config();
 
 /**
  * Creates and returns a nodemailer transporter configured for Gmail SMTP
+ * Optimized for faster sending with connection pooling
  */
 export function createTransporter() {
   if (!process.env.SMTP_EMAIL || !process.env.SMTP_PASSWORD) {
@@ -14,12 +15,41 @@ export function createTransporter() {
   return nodemailer.createTransport({
     host: 'smtp.gmail.com',
     port: 587,
-    secure: false,
+    secure: false, // Use STARTTLS
     auth: {
       user: process.env.SMTP_EMAIL,
       pass: process.env.SMTP_PASSWORD,
     },
+    // Optimize connection settings for maximum speed
+    pool: false, // Gmail SMTP doesn't support persistent connections on port 587
+    socketTimeout: 3000, // Further reduced timeout for faster failure detection
+    connectionTimeout: 3000, // Further reduced timeout for faster connection
+    greetingTimeout: 3000, // Further reduced timeout
+    // Optimize TLS for speed
+    requireTLS: true,
+    tls: {
+      rejectUnauthorized: false, // Accept self-signed certificates if needed
+      minVersion: 'TLSv1.2',
+    },
+    // Disable debug logging for performance
+    debug: false,
+    logger: false,
   });
+}
+
+/**
+ * Verifies the SMTP connection
+ * @param {Object} transporter - nodemailer transporter
+ * @returns {Promise<boolean>} - True if connection is valid
+ */
+export async function verifyConnection(transporter) {
+  try {
+    await transporter.verify();
+    return true;
+  } catch (error) {
+    console.error('SMTP connection verification failed:', error);
+    return false;
+  }
 }
 
 /**
